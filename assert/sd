@@ -1,0 +1,299 @@
+#! /usr/bin/env python
+import json
+import os
+import sys
+from subprocess import Popen,PIPE
+if sys.version_info[0] == 2:
+    from httplib import HTTPConnection
+    from urllib import urlencode
+elif sys.version_info[0] == 3:
+    from http.client import HTTPConnection
+    from urllib.parse import urlencode
+
+SERVICE_SUFFIX = "service"
+env = os.environ
+CONSUL_HOST = env.get("CONSUL_HTTP_HOST") or env.get("TCE_HOST_IP")
+CONSUL_HOST = CONSUL_HOST or "127.0.0.1"
+if env.get('IS_TCE_DOCKER_ENV') == "1" and env.get('IS_HOST_NETWORK') != "1":
+    pipe = Popen("/sbin/ip route|awk '/default/{ print $3}'", stdin = None, stdout = PIPE, shell=True)
+    host = pipe.communicate()[0]
+    if host:
+        if sys.version_info[0] == 3:
+            host = host.decode()
+        CONSUL_HOST = host.strip('\n')
+
+CONSUL_PORT = int(env.get("CONSUL_HTTP_PORT") or 2280)
+CHECK_SCRIPT = '/opt/tiger/consul_deploy/script/check_%s %s'
+
+is_perf_test = True if os.getenv('TCE_PERF_TEST') == '1' else False
+perf_prefix = os.getenv('TCE_PERF_PREFIX', 'tce_perf_test_a3b30390ca0c_')
+whitelist_type = 'consul'
+whitelist = {}
+
+for part in os.getenv('TCE_PERF_WHITELIST', '').split('&'):
+    if isinstance(part, str) and part.startswith(whitelist_type):
+        arr = part.split(':')
+        if len(arr) > 1:
+            whitelist[arr[1]] = None
+
+
+def add_perf_prefix(name):
+    if not is_perf_test or name in whitelist or isinstance(name, str) and name.startswith(perf_prefix):
+        return name
+    return perf_prefix + name
+
+
+IGNORE_UP_DIR = "/opt/tiger/dist"
+IGNORE_UP_ALL = os.path.join(IGNORE_UP_DIR, ".ignore_sd_up")
+
+
+def need_ignore_up(name):
+    ign_srv_file = os.path.join(IGNORE_UP_DIR, ".ignore_sd_up_%s" % name)
+    return os.path.isfile(IGNORE_UP_ALL) or os.path.isfile(ign_srv_file)
+
+
+def load_tags(service_tags):
+    if service_tags is None:
+        return {}
+    return {kv[0]: kv[1] if len(kv) > 1 else True for kv in map(lambda x: x.split(':'), service_tags)}
+
+
+def dump_tags(tags):
+    return ["%s:%s" % (k, tags[k]) for k in tags]
+
+
+def load_service_node(service_node):
+    return service_node['Address'], int(service_node['Port']), load_tags(service_node['Tags'])
+
+
+def strip_domain(s):
+    return s.strip(".")
+
+
+def resolve_name(name):
+    name = strip_domain(name)
+    # strip domain
+    info = self_info
+    node, dc, domain = info['Config']['NodeName'], info['Config']['Datacenter'], info['Config']['Domain']
+    if name.endswith(domain):
+        name = name[0:-len(domain) - 1]
+    # service part indicates a consul service
+    separator = ".%s" % SERVICE_SUFFIX
+    if name.find(separator) > 0:
+        service, dc = name.split(separator)
+        dc = strip_domain(dc) if len(dc) > 1 else dc
+    else:
+        service, dc = name, dc
+    return service, dc
+
+
+def canonical_name(service):
+    info = self_info
+    node, dc, domain = info['Config']['NodeName'], info['Config']['Datacenter'], info['Config']['Domain']
+    if service.endswith(domain):
+        return service
+    return ".".join([service, SERVICE_SUFFIX, dc, domain])
+
+
+def print_table(matrix):
+    col_width = []
+    for j in range(0, len(matrix[0])):
+        col_width.append(max([len(str(row[j])) for row in matrix]) + 2)
+    col_width[-1] = 0
+    for row in matrix:
+        print("".join(str(row[k]).ljust(col_width[k]) for k in range(0, len(row))))
+
+
+def call_consul(method, uri, body=None, host=CONSUL_HOST):
+    conn = HTTPConnection(host, CONSUL_PORT, timeout=10)
+    conn.request(method, uri, body)
+    response = conn.getresponse()
+    if response.status != 200:
+        raise Exception(str(response.read()))
+    if method == 'GET':
+        info = json.loads(response.read())
+        return info
+    return {}
+
+
+def checks():
+    return call_consul('GET', '/v1/agent/checks', None)
+
+
+def services():
+    return call_consul('GET', '/v1/agent/services', None)
+
+
+def up(name, port, *args):
+    if need_ignore_up(name):
+        prefix = "dev."
+        print("Service name is shifted to %s%s as it's a dev environment." % (prefix, name))
+        name = "%s%s" % (prefix, name)
+    i = 0
+    svc_checks = []
+    tags = {}
+    need_check = False
+    skip_pre_check = False
+    checkpid = os.getppid()
+    while i < len(args):
+        if args[i] == '--daemontools-svc':
+            svc_checks.append(('daemontools', args[i + 1]))
+            need_check = True
+            i += 2
+        elif args[i] == '--systemd-svc':
+            svc_checks.append(('systemd', args[i + 1]))
+            need_check = True
+            i += 2
+        elif args[i] == '--tags':
+            tags = json.loads(args[i + 1])
+            i += 2
+        elif args[i] == '--pid':
+            checkpid = args[i + 1]
+            i += 2
+        elif args[i] == '--container':
+            # FIXME: what if pid got replaced?
+            svc_checks.append(('process_ephemeral', '%s %s %s' % (checkpid, name, port)))
+            need_check = True
+            i += 1
+        elif args[i] == '--container-cgroup':
+            svc_checks.append(('cgroup_ephemeral', '%s %s %s' % (checkpid, name, port)))
+            need_check = True
+            i += 1
+        elif args[i] in ('--mesos-executor', '--docker-container'):
+            opt = args[i]
+            i += 1
+
+            try:
+                entity_id = args[i]
+            except IndexError:
+                print("Must specify a %s ID" % opt)
+                sys.exit(1)
+
+            filename = {
+                '--mesos-executor': "mesos_executor.py",
+                '--docker-container': "docker_container.sh",
+            }[opt]
+
+            svc_checks.append((filename, '%s %s %s' % (entity_id, name, port)))
+            need_check = True
+            skip_pre_check = True
+            i += 1
+        else:
+            print("Invalid argument: %s" % args[i])
+            sys.exit(1)
+
+    available_check = None
+    for check in svc_checks:
+        script = CHECK_SCRIPT % (check[0], check[1])
+        if skip_pre_check or os.system(script) == 0:
+            available_check = check
+            print('Using check script: %s' % script)
+            break
+    if need_check is True and available_check is None:
+        print("Failed to find a available check")
+        sys.exit(2)
+    script = CHECK_SCRIPT % (available_check[0], available_check[1]) if need_check else None
+    if is_perf_test:
+        name = add_perf_prefix(name)
+    ttl = None if script is None else 30
+    service, dc = resolve_name(name)
+    service_id = "%s-%s" % (service, port)
+    service_tags = dump_tags(tags)
+    check = {}
+    if script:
+        check['script'] = script
+        check['interval'] = '%ss' % ttl
+    elif ttl:
+        check['ttl'] = '%ss' % ttl
+    payload = {
+        'id': service_id,
+        'name': service,
+        'port': int(port),
+        'tags': service_tags,
+        'check': check,
+    }
+    call_consul('PUT', "/v1/agent/service/register", json.dumps(payload))
+    print("Successfully brought up %s on port %s" % (name, port))
+
+
+def down(name, port):
+    if is_perf_test:
+        name = add_perf_prefix(name)
+    name, _ = resolve_name(name)
+    service_id = "%s-%s" % (name, port)
+    call_consul('PUT', '/v1/agent/service/deregister/{}'.format(service_id))
+    print("Successfully brought down %s on port %s" % (name, port))
+
+
+def lookup(name):
+    cn = canonical_name(name)
+    service, dc = resolve_name(name)
+    if is_perf_test:
+        name = add_perf_prefix(name)
+    host, port = name if isinstance(name, tuple) else (name, 0)
+
+    params = {'name': host}
+    params = urlencode(params)
+    items = call_consul('GET', '/v1/lookup/name?%s' % params)
+
+    endpoints = [(x['Host'], x['Port'], x['Tags']) for x in items]
+    print("Canonical name: %s" % cn)
+    print("Service name: %s" % service)
+    print("Data center: %s" % dc)
+    print("")
+    data = [('IP', 'Port', 'Tags')] + list(endpoints)
+    print_table(data)
+
+
+def report():
+    info = self_info
+    check_result = checks()
+    statuses = {v['ServiceID']: v['Status'] for k, v in check_result.items()}
+
+    service_list = [
+        (v['ID'], v['Service'], v['Port'], statuses[v['ID']] if v['ID'] in statuses else 'unknown',
+         load_tags(v['Tags'])) for k, v in services().items()
+    ]
+    node, dc, domain = info['Config']['NodeName'], info['Config']['Datacenter'], info['Config']['Domain']
+    print(
+        "Agent is running (RPC port: {}, HTTP port: {}, DNS port: {}).".format(
+            info['Config']['Ports']['RPC'],
+            info['Config']['Ports']['HTTP'],
+            info['Config']['Ports']['DNS']
+        )
+    )
+    print("Node name: {}".format(node))
+    print("Data center: {}".format(dc))
+    print("Domain: {}".format(domain))
+    print("")
+    print_table([('ID', 'Service', 'Port', 'Status', 'Tags')] + service_list)
+    print("")
+    print("NOTE: Services with status other than 'passing' will not be visible during lookup.")
+
+
+def usage():
+    print("""Usage: sd [options...] COMMAND [args...]
+Supported commands are:
+  lookup <name>         Lookup endpoints associated with given name, which could be either canonical name or service name.
+  report                Report local agent status, including currently alive services registered in local.
+  up <name> <port>      Register given service (no health check).
+  down <name> <port>    Deregister given service (no health check).
+                          ...""")
+    exit(1)
+
+
+if __name__ == '__main__':
+    try:
+        command = sys.argv[1]
+        args = sys.argv[2:]
+        if command in globals():
+            global self_info
+            self_info = call_consul('GET', '/v1/agent/self', None)
+            sys.exit(globals()[command](*args))
+        else:
+            usage()
+    except (IndexError, KeyError, TypeError) as ex:
+        import traceback
+
+        traceback.print_exc()
+        usage()
